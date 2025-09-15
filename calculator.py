@@ -510,10 +510,36 @@ def compute_recommendation(symbol):
         for exp_date in exp_dates:
             options_chains[exp_date] = get_option_chain(symbol, exp_date, underlying_price)
 
+        # Helpers to compute robust mid prices and ATM IV/straddle
+        def _mid_from_quotes(bid, ask):
+            vals = [v for v in (bid, ask) if v is not None and np.isfinite(v) and v > 0]
+            if len(vals) == 2:
+                return (vals[0] + vals[1]) / 2.0
+            elif len(vals) == 1:
+                return vals[0]
+            return None
+
+        def _nearest_mid(side, target):
+            if not side:
+                return None
+            strikes = np.array([s.get("strike") for s in side], dtype=float)
+            # Filter to finite strikes
+            finite = np.isfinite(strikes)
+            if not finite.any():
+                return None
+            idxs = np.where(finite)[0]
+            order = idxs[np.argsort(np.abs(strikes[idxs] - target))]
+            for j in order:
+                bid = side[j].get("bid")
+                ask = side[j].get("ask")
+                mid = _mid_from_quotes(bid, ask)
+                if mid is not None and mid > 0:
+                    return float(mid)
+            return None
+
         # Find ATM IV and straddle for each expiration
         atm_iv = {}
         straddle = None
-        i = 0
         for exp_date, chain in options_chains.items():
             calls = chain.get("calls", [])
             puts = chain.get("puts", [])
@@ -521,12 +547,12 @@ def compute_recommendation(symbol):
                 continue
 
             # Find ATM call and put
-            call_strikes = np.array([c["strike"] for c in calls])
-            put_strikes = np.array([p["strike"] for p in puts])
-            call_idx = np.abs(call_strikes - underlying_price).argmin()
-            put_idx = np.abs(put_strikes - underlying_price).argmin()
-            call_iv = calls[call_idx].get("impliedVolatility")
-            put_iv = puts[put_idx].get("impliedVolatility")
+            call_strikes = np.array([c["strike"] for c in calls], dtype=float)
+            put_strikes = np.array([p["strike"] for p in puts], dtype=float)
+            call_idx = np.nanargmin(np.abs(call_strikes - underlying_price)) if call_strikes.size else None
+            put_idx = np.nanargmin(np.abs(put_strikes - underlying_price)) if put_strikes.size else None
+            call_iv = calls[call_idx].get("impliedVolatility") if call_idx is not None else None
+            put_iv = puts[put_idx].get("impliedVolatility") if put_idx is not None else None
 
             if call_iv is None or put_iv is None:
                 continue
@@ -534,24 +560,12 @@ def compute_recommendation(symbol):
             atm_iv_value = (call_iv + put_iv) / 2.0
             atm_iv[exp_date] = atm_iv_value
 
-            if i == 0:
-                call_bid = calls[call_idx].get("bid")
-                call_ask = calls[call_idx].get("ask")
-                put_bid = puts[put_idx].get("bid")
-                put_ask = puts[put_idx].get("ask")
-                call_mid = (
-                    (call_bid + call_ask) / 2.0
-                    if call_bid is not None and call_ask is not None
-                    else None
-                )
-                put_mid = (
-                    (put_bid + put_ask) / 2.0
-                    if put_bid is not None and put_ask is not None
-                    else None
-                )
+            # Capture first available straddle (near-term) from nearest quotes
+            if straddle is None:
+                call_mid = _nearest_mid(calls, underlying_price)
+                put_mid = _nearest_mid(puts, underlying_price)
                 if call_mid is not None and put_mid is not None:
                     straddle = call_mid + put_mid
-            i += 1
 
         if not atm_iv:
             return "Error: Could not determine ATM IV for any expiration dates."
@@ -581,9 +595,11 @@ def compute_recommendation(symbol):
         avg_volume = (
             price_history["Volume"].rolling(window=window, min_periods=1).mean().iloc[-1]
         )
-        expected_move = (
-            str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
-        )
+        # Compute expected move as percent of underlying using nearest valid straddle
+        if straddle is not None and underlying_price and underlying_price > 0:
+            expected_move = f"{round((straddle / underlying_price) * 100.0, 2)}%"
+        else:
+            expected_move = None
 
         return {
             "avg_volume": avg_volume >= 1500000,
