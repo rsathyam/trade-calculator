@@ -117,18 +117,45 @@ def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True
 
 
 def build_term_structure(days, ivs):
-    days = np.array(days)
-    ivs = np.array(ivs)
-    sort_idx = days.argsort()
-    days = days[sort_idx]
-    ivs = ivs[sort_idx]
-    spline = interp1d(days, ivs, kind="linear", fill_value="extrapolate")
+    # Prepare arrays and drop non-finite values
+    days_arr = np.asarray(days, dtype=float)
+    ivs_arr = np.asarray(ivs, dtype=float)
+    mask = np.isfinite(days_arr) & np.isfinite(ivs_arr)
+    days_arr = days_arr[mask]
+    ivs_arr = ivs_arr[mask]
+
+    # Deduplicate days by averaging IVs for the same day (prevents zero division in interp1d)
+    if days_arr.size == 0:
+        def term_spline(_):
+            return float("nan")
+        return term_spline
+
+    unique = {}
+    for d, v in zip(days_arr, ivs_arr):
+        di = int(round(d))
+        if di in unique:
+            unique[di].append(float(v))
+        else:
+            unique[di] = [float(v)]
+
+    uniq_days = np.array(sorted(unique.keys()), dtype=float)
+    uniq_ivs = np.array([float(np.mean(unique[d])) for d in uniq_days], dtype=float)
+
+    # If only one unique day, return a constant function
+    if uniq_days.size == 1:
+        const_iv = float(uniq_ivs[0])
+        def term_spline(_):
+            return const_iv
+        return term_spline
+
+    # Build a linear interpolator on strictly increasing x
+    spline = interp1d(uniq_days, uniq_ivs, kind="linear", fill_value="extrapolate")
 
     def term_spline(dte):
-        if dte < days[0]:
-            return ivs[0]
-        elif dte > days[-1]:
-            return ivs[-1]
+        if dte < uniq_days[0]:
+            return float(uniq_ivs[0])
+        elif dte > uniq_days[-1]:
+            return float(uniq_ivs[-1])
         else:
             return float(spline(dte))
 
