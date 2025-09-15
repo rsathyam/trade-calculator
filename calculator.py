@@ -389,11 +389,20 @@ def get_option_chain(symbol, expiration, underlying_price=None):
                         if hasattr(last_quote, "ask")
                         else last_quote.get("ask") if isinstance(last_quote, dict) else None
                     )
+                    # Optional last trade price as fallback
+                    last_trade = getattr(snap, "last_trade", None)
+                    last_price = None
+                    if last_trade is not None:
+                        if hasattr(last_trade, "price"):
+                            last_price = getattr(last_trade, "price", None)
+                        elif isinstance(last_trade, dict):
+                            last_price = last_trade.get("price") or last_trade.get("p")
                     row = {
                         "strike": float(strike) if strike is not None else None,
                         "impliedVolatility": float(iv) if iv is not None else None,
                         "bid": float(bid) if bid is not None else None,
                         "ask": float(ask) if ask is not None else None,
+                        "last": float(last_price) if last_price is not None else None,
                     }
                     if contract_type and str(contract_type).lower() == "call":
                         calls.append(row)
@@ -445,7 +454,21 @@ def get_option_chain(symbol, expiration, underlying_price=None):
     for item in results:
         details = item.get("details", {})
         last_quote = item.get("last_quote", {}) or item.get("lastQuote", {})
-        contract_type = details.get("contract_type") or details.get("contractType")
+        # Contract type normalization across possible keys
+        contract_type = (
+            details.get("contract_type")
+            or details.get("contractType")
+            or item.get("contract_type")
+            or item.get("contractType")
+            or details.get("option_type")
+            or details.get("optionType")
+            or item.get("option_type")
+            or item.get("optionType")
+            or details.get("type")
+            or item.get("type")
+            or details.get("put_call")
+            or item.get("put_call")
+        )
         strike = details.get("strike_price") or details.get("strikePrice")
         iv = (
             item.get("implied_volatility")
@@ -462,11 +485,19 @@ def get_option_chain(symbol, expiration, underlying_price=None):
             or last_quote.get("ask_price")
             or last_quote.get("pAsk")
         )
+        last_trade = item.get("last_trade") or item.get("lastTrade") or {}
+        last_price = (
+            last_trade.get("price")
+            or last_trade.get("p")
+            or item.get("last_price")
+            or item.get("lastPrice")
+        )
         row = {
             "strike": float(strike) if strike is not None else None,
             "impliedVolatility": float(iv) if iv is not None else None,
             "bid": float(bid) if bid is not None else None,
             "ask": float(ask) if ask is not None else None,
+            "last": float(last_price) if last_price is not None else None,
         }
         if contract_type and contract_type.lower() == "call":
             calls.append(row)
@@ -511,12 +542,15 @@ def compute_recommendation(symbol):
             options_chains[exp_date] = get_option_chain(symbol, exp_date, underlying_price)
 
         # Helpers to compute robust mid prices and ATM IV/straddle
-        def _mid_from_quotes(bid, ask):
+        def _mid_from_quotes(bid, ask, last=None):
             vals = [v for v in (bid, ask) if v is not None and np.isfinite(v) and v > 0]
             if len(vals) == 2:
                 return (vals[0] + vals[1]) / 2.0
             elif len(vals) == 1:
                 return vals[0]
+            # Fallback to last trade price if positive
+            if last is not None and np.isfinite(last) and last > 0:
+                return float(last)
             return None
 
         def _nearest_mid(side, target):
@@ -532,7 +566,8 @@ def compute_recommendation(symbol):
             for j in order:
                 bid = side[j].get("bid")
                 ask = side[j].get("ask")
-                mid = _mid_from_quotes(bid, ask)
+                last = side[j].get("last")
+                mid = _mid_from_quotes(bid, ask, last)
                 if mid is not None and mid > 0:
                     return float(mid)
             return None

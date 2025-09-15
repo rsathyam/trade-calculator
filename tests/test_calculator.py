@@ -59,6 +59,36 @@ def test_expected_move_populates_with_partial_quotes(monkeypatch):
     assert result.get("expected_move") == "9.0%"
 
 
+def test_expected_move_uses_last_trade_when_no_quotes(monkeypatch):
+    symbol = "TEST2"
+    today = datetime.today().date()
+    exp1 = (today + timedelta(days=10)).strftime("%Y-%m-%d")
+    exp2 = (today + timedelta(days=50)).strftime("%Y-%m-%d")
+
+    monkeypatch.setattr(calc, "get_current_price", lambda s: 200.0)
+    monkeypatch.setattr(calc, "get_option_expirations", lambda s: [exp1, exp2])
+
+    def fake_chain(sym, expiration, underlying_price=None):
+        strikes = [190.0, 200.0, 210.0]
+        calls = [
+            {"strike": k, "impliedVolatility": 0.4, "bid": None, "ask": None, "last": 6.0 if k == 200.0 else None}
+            for k in strikes
+        ]
+        puts = [
+            {"strike": k, "impliedVolatility": 0.4, "bid": None, "ask": None, "last": 5.0 if k == 200.0 else None}
+            for k in strikes
+        ]
+        return {"calls": calls, "puts": puts}
+
+    monkeypatch.setattr(calc, "get_option_chain", fake_chain)
+    monkeypatch.setattr(calc, "get_price_history", lambda s: _mk_history())
+
+    result = calc.compute_recommendation(symbol)
+    assert isinstance(result, dict)
+    # Straddle from last trades: 6 + 5 = 11; 11 / 200 = 5.5%
+    assert result.get("expected_move") == "5.5%"
+
+
 def test_term_structure_deduplicates_days():
     ts = calc.build_term_structure([30, 30, 45], [0.5, 0.7, 0.6])
     assert abs(ts(30) - 0.6) < 1e-9
@@ -81,4 +111,3 @@ def test_yang_zhang_handles_insufficient_data():
     )
     val = calc.yang_zhang(df)
     assert isinstance(val, float) and math.isnan(val)
-
