@@ -9,6 +9,7 @@ Always consult a professional financial advisor before making any investment dec
 
 import os
 import time
+import math
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -389,6 +390,14 @@ def get_option_chain(symbol, expiration, underlying_price=None):
                         if hasattr(last_quote, "ask")
                         else last_quote.get("ask") if isinstance(last_quote, dict) else None
                     )
+                    mark = None
+                    if isinstance(last_quote, dict):
+                        mark = (
+                            last_quote.get("mid")
+                            or last_quote.get("midpoint")
+                            or last_quote.get("mark")
+                            or last_quote.get("mark_price")
+                        )
                     # Optional last trade price as fallback
                     last_trade = getattr(snap, "last_trade", None)
                     last_price = None
@@ -402,6 +411,7 @@ def get_option_chain(symbol, expiration, underlying_price=None):
                         "impliedVolatility": float(iv) if iv is not None else None,
                         "bid": float(bid) if bid is not None else None,
                         "ask": float(ask) if ask is not None else None,
+                        "mark": float(mark) if mark is not None else None,
                         "last": float(last_price) if last_price is not None else None,
                     }
                     if contract_type and str(contract_type).lower() == "call":
@@ -485,6 +495,12 @@ def get_option_chain(symbol, expiration, underlying_price=None):
             or last_quote.get("ask_price")
             or last_quote.get("pAsk")
         )
+        mark = (
+            last_quote.get("mid")
+            or last_quote.get("midpoint")
+            or last_quote.get("mark")
+            or last_quote.get("mark_price")
+        )
         last_trade = item.get("last_trade") or item.get("lastTrade") or {}
         last_price = (
             last_trade.get("price")
@@ -497,6 +513,7 @@ def get_option_chain(symbol, expiration, underlying_price=None):
             "impliedVolatility": float(iv) if iv is not None else None,
             "bid": float(bid) if bid is not None else None,
             "ask": float(ask) if ask is not None else None,
+            "mark": float(mark) if mark is not None else None,
             "last": float(last_price) if last_price is not None else None,
         }
         if contract_type and contract_type.lower() == "call":
@@ -542,15 +559,17 @@ def compute_recommendation(symbol):
             options_chains[exp_date] = get_option_chain(symbol, exp_date, underlying_price)
 
         # Helpers to compute robust mid prices and ATM IV/straddle
-        def _mid_from_quotes(bid, ask, last=None):
+        def _mid_from_quotes(bid, ask, last=None, mark=None):
             vals = [v for v in (bid, ask) if v is not None and np.isfinite(v) and v > 0]
             if len(vals) == 2:
                 return (vals[0] + vals[1]) / 2.0
-            elif len(vals) == 1:
-                return vals[0]
-            # Fallback to last trade price if positive
+            # Prefer mark then last if available
+            if mark is not None and np.isfinite(mark) and mark > 0:
+                return float(mark)
             if last is not None and np.isfinite(last) and last > 0:
                 return float(last)
+            if len(vals) == 1:
+                return vals[0]
             return None
 
         def _nearest_mid(side, target):
@@ -567,7 +586,8 @@ def compute_recommendation(symbol):
                 bid = side[j].get("bid")
                 ask = side[j].get("ask")
                 last = side[j].get("last")
-                mid = _mid_from_quotes(bid, ask, last)
+                mark = side[j].get("mark")
+                mid = _mid_from_quotes(bid, ask, last, mark)
                 if mid is not None and mid > 0:
                     return float(mid)
             return None
@@ -630,11 +650,21 @@ def compute_recommendation(symbol):
         avg_volume = (
             price_history["Volume"].rolling(window=window, min_periods=1).mean().iloc[-1]
         )
-        # Compute expected move as percent of underlying using nearest valid straddle
+        # Compute expected move as percent of underlying using nearest valid straddle; fallback to IV-based estimate
+        expected_move = None
         if straddle is not None and underlying_price and underlying_price > 0:
             expected_move = f"{round((straddle / underlying_price) * 100.0, 2)}%"
         else:
-            expected_move = None
+            # Fallback: use shortest-dated ATM IV to estimate EM ~ IV * sqrt(T)
+            if dtes and ivs:
+                # Identify the smallest positive DTE with an IV
+                pairs = [(d, v) for d, v in zip(dtes, ivs) if d is not None and d > 0 and np.isfinite(v)]
+                if pairs:
+                    pairs.sort(key=lambda x: x[0])
+                    dte, iv_atm = pairs[0]
+                    T = max(0.0, float(dte)) / 365.0
+                    em_pct = iv_atm * math.sqrt(T) * 100.0
+                    expected_move = f"{round(em_pct, 2)}%"
 
         return {
             "avg_volume": avg_volume >= 1500000,

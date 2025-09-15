@@ -111,3 +111,35 @@ def test_yang_zhang_handles_insufficient_data():
     )
     val = calc.yang_zhang(df)
     assert isinstance(val, float) and math.isnan(val)
+
+
+def test_expected_move_falls_back_to_iv(monkeypatch):
+    symbol = "TEST3"
+    today = datetime.today().date()
+    exp1 = (today + timedelta(days=20)).strftime("%Y-%m-%d")
+    exp2 = (today + timedelta(days=60)).strftime("%Y-%m-%d")
+
+    monkeypatch.setattr(calc, "get_current_price", lambda s: 150.0)
+    monkeypatch.setattr(calc, "get_option_expirations", lambda s: [exp1, exp2])
+
+    # No quotes and no last, but IV present
+    def fake_chain(sym, expiration, underlying_price=None):
+        strikes = [140.0, 150.0, 160.0]
+        calls = [
+            {"strike": k, "impliedVolatility": 0.4, "bid": None, "ask": None, "last": None, "mark": None}
+            for k in strikes
+        ]
+        puts = [
+            {"strike": k, "impliedVolatility": 0.4, "bid": None, "ask": None, "last": None, "mark": None}
+            for k in strikes
+        ]
+        return {"calls": calls, "puts": puts}
+
+    monkeypatch.setattr(calc, "get_option_chain", fake_chain)
+    monkeypatch.setattr(calc, "get_price_history", lambda s: _mk_history())
+
+    result = calc.compute_recommendation(symbol)
+    assert isinstance(result, dict)
+    # Fallback uses IV * sqrt(T); with 20 days and IV=0.4 => 0.4*sqrt(20/365)=~0.118
+    # So about 11.8%
+    assert result.get("expected_move") == f"{round(0.4 * math.sqrt(20/365) * 100.0, 2)}%"
