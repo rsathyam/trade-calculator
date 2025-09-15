@@ -111,7 +111,9 @@ def yang_zhang(price_data, window=30, trading_periods=252, return_last_only=True
         trading_periods
     )
     if return_last_only:
-        return result.iloc[-1]
+        # Return the last non-NaN value if available; otherwise NaN
+        last = result.dropna()
+        return last.iloc[-1] if not last.empty else float("nan")
     else:
         return result.dropna()
 
@@ -474,6 +476,8 @@ def get_option_chain(symbol, expiration, underlying_price=None):
 
 
 def compute_recommendation(symbol):
+    # Normalize symbol formatting early
+    symbol = (symbol or "").strip().upper()
     try:
         symbol = symbol.strip().upper()
         if not symbol:
@@ -562,11 +566,21 @@ def compute_recommendation(symbol):
             ivs.append(iv)
 
         term_spline = build_term_structure(dtes, ivs)
-        ts_slope_0_45 = (term_spline(45) - term_spline(dtes[0])) / (45 - dtes[0])
+        # Guard against zero denominator if dtes[0] equals 45
+        denom = (45 - dtes[0])
+        ts_slope_0_45 = (
+            (term_spline(45) - term_spline(dtes[0])) / denom if denom != 0 else 0.0
+        )
 
         price_history = get_price_history(symbol)
-        iv30_rv30 = term_spline(30) / yang_zhang(price_history)
-        avg_volume = price_history["Volume"].rolling(30).mean().dropna().iloc[-1]
+        rv30 = yang_zhang(price_history)
+        iv30 = term_spline(30)
+        iv30_rv30 = (iv30 / rv30) if np.isfinite(rv30) and rv30 > 0 else float("nan")
+        # Use a rolling window sized to available history; require at least 1 observation
+        window = int(min(30, max(1, len(price_history))))
+        avg_volume = (
+            price_history["Volume"].rolling(window=window, min_periods=1).mean().iloc[-1]
+        )
         expected_move = (
             str(round(straddle / underlying_price * 100, 2)) + "%" if straddle else None
         )
