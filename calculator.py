@@ -10,7 +10,7 @@ Always consult a professional financial advisor before making any investment dec
 import os
 import time
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 import requests
 
@@ -73,6 +73,148 @@ def _polygon_get(path, params=None):
         raise RuntimeError(f"Polygon HTTP {status} for {url}: {body}") from e
     except requests.RequestException as e:
         raise RuntimeError(f"Network error calling {url}: {e}") from e
+
+
+def _is_business_day(d: date) -> bool:
+    # Simple weekday check (Mon-Fri). Does not account for market holidays.
+    return d.weekday() < 5
+
+
+def _nth_business_day_from(start: date, n: int) -> date:
+    if n <= 0:
+        return start
+    d = start
+    count = 0
+    while True:
+        if _is_business_day(d):
+            count += 1
+            if count == n:
+                return d
+        d = d + timedelta(days=1)
+
+
+def get_upcoming_earnings_tickers(business_days: int = 5):
+    """Return a sorted list of unique tickers with earnings in the next N business days.
+
+    Uses Polygon v3 reference earnings endpoint filtering by announcement_date.
+    """
+    # Overrides: allow providing upcoming earnings tickers via env or file for flexibility
+    env_list = os.environ.get("EARNINGS_TICKERS")
+    if env_list:
+        return sorted({t.strip().upper() for t in env_list.split(",") if t.strip()})
+    env_file = os.environ.get("EARNINGS_FILE")
+    if env_file and os.path.exists(env_file):
+        tickers = set()
+        try:
+            with open(env_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    # Support CSV-like lines by splitting on commas and whitespace
+                    for part in s.replace("\t", ",").split(","):
+                        p = part.strip()
+                        if p:
+                            tickers.add(p.upper())
+            if tickers:
+                return sorted(tickers)
+        except Exception:
+            pass
+
+    if not POLYGON_API_KEY:
+        raise ValueError(
+            "Missing POLYGON_API_KEY. Set env var POLYGON_API_KEY to your Polygon API key, or provide EARNINGS_TICKERS/EARNINGS_FILE."
+        )
+
+    today = datetime.today().date()
+    end = _nth_business_day_from(today, max(1, int(business_days)))
+    start_iso = today.strftime("%Y-%m-%d")
+    end_iso = end.strftime("%Y-%m-%d")
+
+    # Try multiple possible endpoints/param shapes to maximize compatibility.
+    candidates = [
+        {
+            "path": "/v3/reference/earnings",
+            "from_key": "announcement_date.gte",
+            "to_key": "announcement_date.lte",
+            "sort": "announcement_date",
+        },
+        {
+            "path": "/v2/reference/earnings",
+            "from_key": "announcement_date.gte",
+            "to_key": "announcement_date.lte",
+            "sort": "announcement_date",
+        },
+        {
+            # Some deployments may expose earnings as generic events
+            # Date field may be just `date` here
+            "path": "/v3/reference/events",
+            "from_key": "date.gte",
+            "to_key": "date.lte",
+            "sort": "date",
+            "extra": {"types": "earnings"},
+        },
+        {
+            # Direct earnings subresource
+            "path": "/v3/reference/events/earnings",
+            "from_key": "start_date",
+            "to_key": "end_date",
+            "sort": "start_date",
+        },
+        {
+            # Legacy-style v2 subresource if available
+            "path": "/v2/reference/events/earnings",
+            "from_key": "start_date",
+            "to_key": "end_date",
+            "sort": "start_date",
+        },
+    ]
+
+    last_error = None
+    for c in candidates:
+        try:
+            tickers = set()
+            base_path = c["path"]
+            params = {
+                c["from_key"]: start_iso,
+                c["to_key"]: end_iso,
+                "order": "asc",
+                "sort": c.get("sort", "date"),
+                "limit": 1000,
+            }
+            if c.get("extra"):
+                params.update(c["extra"])
+
+            url = base_path
+            more = True
+            while more:
+                data = _polygon_get(url, params=params if url == base_path else None)
+                results = data.get("results", []) or []
+                for item in results:
+                    t = (
+                        item.get("ticker")
+                        or item.get("T")
+                        or (item.get("details", {}) or {}).get("ticker")
+                    )
+                    if t:
+                        tickers.add(str(t).upper())
+                next_url = data.get("next_url") or data.get("nextUrl")
+                if next_url:
+                    url = str(next_url)
+                    params = None
+                else:
+                    more = False
+            if tickers:
+                return sorted(tickers)
+        except Exception as e:
+            last_error = e
+            # Try next candidate
+            continue
+
+    # If we reach here, all candidates failed
+    raise RuntimeError(
+        f"Unable to fetch upcoming earnings from Polygon endpoints. Last error: {last_error}"
+    )
 
 
 def filter_dates(dates):
@@ -637,19 +779,27 @@ def compute_recommendation(symbol):
         term_spline = build_term_structure(dtes, ivs)
         # Guard against zero denominator if dtes[0] equals 45
         denom = (45 - dtes[0])
-        ts_slope_0_45 = (
+        ts_slope_0_45_value = (
             (term_spline(45) - term_spline(dtes[0])) / denom if denom != 0 else 0.0
         )
 
         price_history = get_price_history(symbol)
         rv30 = yang_zhang(price_history)
         iv30 = term_spline(30)
-        iv30_rv30 = (iv30 / rv30) if np.isfinite(rv30) and rv30 > 0 else float("nan")
+        iv30_rv30_value = (iv30 / rv30) if np.isfinite(rv30) and rv30 > 0 else float("nan")
         # Use a rolling window sized to available history; require at least 1 observation
         window = int(min(30, max(1, len(price_history))))
-        avg_volume = (
+        avg_volume_value = (
             price_history["Volume"].rolling(window=window, min_periods=1).mean().iloc[-1]
         )
+        # Thresholds
+        vol_threshold = 1_500_000
+        ivrv_threshold = 1.25
+        slope_threshold = -0.00406
+        # Booleans
+        avg_volume_bool = bool(avg_volume_value >= vol_threshold)
+        iv30_rv30_bool = bool(np.isfinite(iv30_rv30_value) and iv30_rv30_value >= ivrv_threshold)
+        ts_slope_bool = bool(ts_slope_0_45_value <= slope_threshold)
         # Compute expected move as percent of underlying using nearest valid straddle; fallback to IV-based estimate
         expected_move = None
         if straddle is not None and underlying_price and underlying_price > 0:
@@ -667,9 +817,21 @@ def compute_recommendation(symbol):
                     expected_move = f"{round(em_pct, 2)}%"
 
         return {
-            "avg_volume": avg_volume >= 1500000,
-            "iv30_rv30": iv30_rv30 >= 1.25,
-            "ts_slope_0_45": ts_slope_0_45 <= -0.00406,
+            # Pass/Fail flags (used by scanners/labels)
+            "avg_volume": avg_volume_bool,
+            "iv30_rv30": iv30_rv30_bool,
+            "ts_slope_0_45": ts_slope_bool,
+            # Metric values for explanation
+            "avg_volume_value": float(avg_volume_value) if np.isfinite(avg_volume_value) else None,
+            "avg_volume_threshold": float(vol_threshold),
+            "avg_volume_window": int(window),
+            "iv30": float(iv30) if np.isfinite(iv30) else None,
+            "rv30": float(rv30) if np.isfinite(rv30) else None,
+            "iv30_rv30_value": float(iv30_rv30_value) if np.isfinite(iv30_rv30_value) else None,
+            "iv30_rv30_threshold": float(ivrv_threshold),
+            "ts_slope_0_45_value": float(ts_slope_0_45_value) if np.isfinite(ts_slope_0_45_value) else None,
+            "ts_slope_0_45_threshold": float(slope_threshold),
+            # Other outputs
             "expected_move": expected_move,
         }
     except Exception as e:
@@ -680,10 +842,10 @@ def print_recommendation(result):
     if isinstance(result, str):
         print(result)
         return
-    avg_volume_bool = result["avg_volume"]
-    iv30_rv30_bool = result["iv30_rv30"]
-    ts_slope_bool = result["ts_slope_0_45"]
-    expected_move = result["expected_move"]
+    avg_volume_bool = result.get("avg_volume", False)
+    iv30_rv30_bool = result.get("iv30_rv30", False)
+    ts_slope_bool = result.get("ts_slope_0_45", False)
+    expected_move = result.get("expected_move")
     if avg_volume_bool and iv30_rv30_bool and ts_slope_bool:
         title = "Recommended"
     elif ts_slope_bool and (
@@ -693,21 +855,145 @@ def print_recommendation(result):
         title = "Consider"
     else:
         title = "Avoid"
+    def _fmt_large(n):
+        try:
+            v = float(n)
+        except Exception:
+            return str(n)
+        absv = abs(v)
+        if absv >= 1_000_000_000:
+            return f"{v/1_000_000_000:.2f}B"
+        if absv >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        if absv >= 1_000:
+            return f"{v/1_000:.2f}K"
+        return f"{v:.0f}"
+
     print(f"\nResult: {title}")
-    print(f"avg_volume:    {'PASS' if avg_volume_bool else 'FAIL'}")
-    print(f"iv30_rv30:     {'PASS' if iv30_rv30_bool else 'FAIL'}")
-    print(f"ts_slope_0_45: {'PASS' if ts_slope_bool else 'FAIL'}")
+    # avg volume explanation
+    av_val = result.get("avg_volume_value")
+    av_thr = result.get("avg_volume_threshold")
+    av_win = result.get("avg_volume_window")
+    if av_val is not None and av_thr is not None:
+        print(
+            f"avg_volume:    {'PASS' if avg_volume_bool else 'FAIL'} — "
+            f"{_fmt_large(av_val)} >= {_fmt_large(av_thr)} ({av_win}-day average volume)"
+        )
+    else:
+        print(f"avg_volume:    {'PASS' if avg_volume_bool else 'FAIL'}")
+    # iv/rv explanation
+    iv = result.get("iv30")
+    rv = result.get("rv30")
+    ratio = result.get("iv30_rv30_value")
+    ratio_thr = result.get("iv30_rv30_threshold")
+    if ratio is not None and ratio_thr is not None:
+        iv_s = f"{iv:.2f}" if isinstance(iv, (int, float)) and np.isfinite(iv) else "n/a"
+        rv_s = f"{rv:.2f}" if isinstance(rv, (int, float)) and np.isfinite(rv) else "n/a"
+        print(
+            f"iv30/rv30:    {'PASS' if iv30_rv30_bool else 'FAIL'} — "
+            f"{ratio:.2f} >= {ratio_thr:.2f} (IV30={iv_s}, RV30={rv_s})"
+        )
+    else:
+        print(f"iv30/rv30:    {'PASS' if iv30_rv30_bool else 'FAIL'}")
+    # term structure slope explanation
+    slope = result.get("ts_slope_0_45_value")
+    slope_thr = result.get("ts_slope_0_45_threshold")
+    if slope is not None and slope_thr is not None:
+        print(
+            f"ts_slope_0_45: {'PASS' if ts_slope_bool else 'FAIL'} — "
+            f"{slope:.5f} <= {slope_thr:.5f} (0–45 day IV slope; negative indicates backwardation)"
+        )
+    else:
+        print(f"ts_slope_0_45: {'PASS' if ts_slope_bool else 'FAIL'}")
     print(f"Expected Move: {expected_move}")
+
+
+def _label_from_result(result):
+    if isinstance(result, str):
+        return "Error"
+    avg_volume_bool = result.get("avg_volume", False)
+    iv30_rv30_bool = result.get("iv30_rv30", False)
+    ts_slope_bool = result.get("ts_slope_0_45", False)
+    if avg_volume_bool and iv30_rv30_bool and ts_slope_bool:
+        return "Recommended"
+    if ts_slope_bool and ((avg_volume_bool and not iv30_rv30_bool) or (iv30_rv30_bool and not avg_volume_bool)):
+        return "Consider"
+    return "Avoid"
+
+
+def scan_upcoming_earnings(business_days: int = 5, include_consider: bool = True):
+    """Scan all tickers with earnings in the next N business days and return eligibility.
+
+    Returns a dict with keys: recommended, consider, avoid, errors.
+    Each value is a list of dicts with ticker, label, expected_move and the raw result.
+    """
+    tickers = get_upcoming_earnings_tickers(business_days)
+    out = {"recommended": [], "consider": [], "avoid": [], "errors": []}
+    for t in tickers:
+        try:
+            res = compute_recommendation(t)
+        except Exception as e:
+            out["errors"].append({"ticker": t, "error": str(e)})
+            continue
+        label = _label_from_result(res)
+        entry = {
+            "ticker": t,
+            "label": label,
+            "expected_move": None if isinstance(res, str) else res.get("expected_move"),
+            "result": res,
+        }
+        if label == "Recommended":
+            out["recommended"].append(entry)
+        elif label == "Consider" and include_consider:
+            out["consider"].append(entry)
+        elif label == "Avoid":
+            out["avoid"].append(entry)
+        else:
+            out["errors"].append(entry)
+    return out
 
 
 def main():
     print("Earnings Position Checker (CLI, Polygon)")
     print("----------------------------------------")
+    print("Type 'auto' to scan tickers with earnings in next 5 business days.")
+    print("You can also specify days like 'auto 3'.")
     while True:
         stock = input("Enter Stock Symbol (or 'exit' to quit): ").strip()
         if stock.lower() == "exit":
             print("Exiting.")
             break
+        if stock.lower().startswith("auto"):
+            parts = stock.split()
+            days = 5
+            if len(parts) > 1:
+                try:
+                    days = max(1, int(parts[1]))
+                except Exception:
+                    print("Invalid number of days. Using 5.")
+                    days = 5
+            print(f"Scanning upcoming earnings over next {days} business days...")
+            try:
+                summary = scan_upcoming_earnings(days)
+            except Exception as e:
+                print(f"Error during auto-scan: {e}")
+                print("-" * 40)
+                continue
+            recs = summary.get("recommended", [])
+            cons = summary.get("consider", [])
+            print(f"Found {len(recs)} Recommended and {len(cons)} Consider candidates.")
+            if recs:
+                print("\nRecommended:")
+                for item in recs:
+                    em = item.get("expected_move")
+                    print(f"- {item['ticker']} (EM: {em})")
+            if cons:
+                print("\nConsider:")
+                for item in cons:
+                    em = item.get("expected_move")
+                    print(f"- {item['ticker']} (EM: {em})")
+            print("-" * 40)
+            continue
         if not stock:
             print("Please enter a valid stock symbol.")
             continue
